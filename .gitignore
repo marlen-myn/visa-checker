@@ -1,0 +1,16 @@
+# Sensitive config (contains bot token and chat ID)
+config.json
+
+# Runtime data
+last_date.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
