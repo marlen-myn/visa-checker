@@ -1,269 +1,364 @@
 #!/usr/bin/env python3
 """
-Irish Immigration Visa Date Checker
+Irish Immigration Checker
 
-This script monitors the Irish Immigration website for changes in the 
-"Date applications received in Dublin" for "Tourism or visit a family/friend" category.
-When a change is detected, it sends a Telegram notification.
+Monitors two Irish Immigration pages and sends Telegram notifications on changes:
+1. Visa decisions — "Tourism or visit a family/friend" processing date
+2. IRP renewal — submission date currently being processed per stamp category
+
+Each checker is toggled on/off via config.json.
 
 Usage: python3 checker.py
-Schedule with cron: 0 9 * * * /usr/bin/python3 /path/to/checker.py
+Schedule: 0 9 * * * /usr/bin/python3 /path/to/checker.py
 """
 
-import requests
-from bs4 import BeautifulSoup
 import json
-import os
 import logging
+import os
+from contextlib import contextmanager
 from datetime import datetime
-import re
+
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# Resolve paths relative to the script's directory
+# Paths relative to script location
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
-DATA_FILE = os.path.join(SCRIPT_DIR, 'last_date.json')
-LOG_FILE = os.path.join(SCRIPT_DIR, 'checker.log')
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+DATA_FILE = os.path.join(SCRIPT_DIR, "last_date.json")
+LOG_FILE = os.path.join(SCRIPT_DIR, "checker.log")
 
-
-def load_telegram_config():
-    """Load Telegram bot_token and chat_id from config.json."""
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-        if 'bot_token' not in config or 'chat_id' not in config:
-            logging.error("config.json must contain 'bot_token' and 'chat_id'")
-            return None
-        return config
-    except FileNotFoundError:
-        logging.error("config.json not found. Copy config.json.example to config.json and fill in your credentials.")
-        return None
-    except json.JSONDecodeError as e:
-        logging.error(f"Invalid JSON in config.json: {e}")
-        return None
-
-
-TELEGRAM_CONFIG = load_telegram_config()
+# Target URLs
+VISA_DECISIONS_URL = "https://www.irishimmigration.ie/visa-decisions/"
+IRP_RENEWAL_URL = (
+    "https://www.irishimmigration.ie/registering-your-immigration-permission/"
+    "how-to-renew-your-current-permission/"
+    "renewing-your-registration-permission-if-you-live-in-the-republic-of-ireland"
+)
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
+logger = logging.getLogger(__name__)
 
-def get_visa_date():
-    """
-    Scrape the Irish Immigration website to get the current date for
-    "Tourism or visit a family/friend" applications received in Dublin.
-    First tries Selenium for JavaScript content, then falls back to manual setup.
-    
-    Returns:
-        str: The date string found on the website, or None if not found
-    """
-    url = "https://www.irishimmigration.ie/visa-decisions/"
-    
-    # Try Selenium first (for JavaScript-loaded content)
+
+# =============================================================================
+# CONFIGURATION & DATA
+# =============================================================================
+
+
+def load_config():
+    """Load and validate configuration from config.json."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logger.error("config.json not found. Copy config.json.example and fill in credentials.")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in config.json: {e}")
+        return None
+
+    if not config.get("bot_token") or not config.get("chat_id"):
+        logger.error("config.json must contain non-empty 'bot_token' and 'chat_id'")
+        return None
+
+    return config
+
+
+def load_data():
+    """Load stored state from the data file."""
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Error loading data file: {e}")
+    return {}
+
+
+def save_data(data):
+    """Persist state to the data file."""
+    try:
+        data["last_updated"] = datetime.now().isoformat()
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError as e:
+        logger.error(f"Error saving data file: {e}")
+
+
+# =============================================================================
+# SELENIUM HELPERS
+# =============================================================================
+
+
+@contextmanager
+def chrome_driver():
+    """Context manager for a headless Chrome WebDriver."""
+    options = Options()
+    for arg in [
+        "--headless",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1920,1080",
+        "--disable-extensions",
+        "--disable-logging",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    ]:
+        options.add_argument(arg)
+
     driver = None
     try:
-        # Set up Chrome options for headless browsing
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--disable-extensions')
-        chrome_options.add_argument('--disable-logging')
-        chrome_options.add_argument('--disable-background-timer-throttling')
-        chrome_options.add_argument('--disable-backgrounding-occluded-windows')
-        chrome_options.add_argument('--disable-renderer-backgrounding')
-        
-        # Initialize the Chrome driver with timeout
-        logging.info("Attempting to initialize Chrome driver...")
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(30)
-        logging.info("Chrome driver initialized successfully")
-        
-        # Load the page
-        logging.info(f"Loading page: {url}")
-        driver.get(url)
-        
-        # Wait for the specific table to load
-        wait = WebDriverWait(driver, 15)
-        
-        try:
-            # Wait for the table with ID "tablepress-8" to appear
-            table = wait.until(EC.presence_of_element_located((By.ID, "tablepress-8")))
-            logging.info("✅ Found table with ID 'tablepress-8' using Selenium!")
-            
-            # Find the specific row and column
-            target_row = table.find_element(By.CSS_SELECTOR, "tr.row-9")
-            logging.info("✅ Found target row with class 'row-9'")
-            
-            target_cell = target_row.find_element(By.CSS_SELECTOR, "td.column-2")
-            logging.info("✅ Found target cell with class 'column-2'")
-            
-            cell_text = target_cell.text.strip()
-            logging.info(f"✅ Cell content: '{cell_text}'")
-            
-            if cell_text:
-                logging.info(f"✅ Successfully extracted date: {cell_text}")
-                return cell_text
-            else:
-                logging.warning("Target cell is empty")
-                
-        except TimeoutException:
-            logging.warning("Table with ID 'tablepress-8' did not load within 15 seconds")
-        
-        logging.warning("Could not find tourism/family visit date with Selenium")
-        return None
-        
-    except WebDriverException as e:
-        logging.error(f"Chrome driver error (may need Chrome installed): {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Selenium error: {e}")
-        return None
+        yield driver
     finally:
-        # Always close the driver
         if driver:
             try:
                 driver.quit()
-                logging.info("Chrome driver closed successfully")
-            except Exception as e:
-                logging.warning(f"Error closing driver: {e}")
+            except Exception:
+                pass
 
-def load_last_date():
+
+# =============================================================================
+# TELEGRAM
+# =============================================================================
+
+
+def send_telegram(config, message):
+    """Send a message via Telegram Bot API. Returns True on success."""
+    url = f"https://api.telegram.org/bot{config['bot_token']}/sendMessage"
+    payload = {
+        "chat_id": config["chat_id"],
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("ok"):
+            logger.info("Telegram notification sent")
+            return True
+        logger.error(f"Telegram API error: {result.get('description')}")
+    except requests.RequestException as e:
+        logger.error(f"Telegram request failed: {e}")
+    return False
+
+
+# =============================================================================
+# VISA DECISIONS CHECKER
+# =============================================================================
+
+
+def get_visa_date():
     """
-    Load the last known date from the data file.
-    
-    Returns:
-        str: The last known date, or None if file doesn't exist
+    Scrape visa decisions page for "Tourism or visit a family/friend"
+    date applications received in Dublin.
     """
     try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get('last_date')
+        with chrome_driver() as driver:
+            logger.info(f"Loading: {VISA_DECISIONS_URL}")
+            driver.get(VISA_DECISIONS_URL)
+
+            wait = WebDriverWait(driver, 15)
+            table = wait.until(EC.presence_of_element_located((By.ID, "tablepress-8")))
+
+            target_row = table.find_element(By.CSS_SELECTOR, "tr.row-9")
+            target_cell = target_row.find_element(By.CSS_SELECTOR, "td.column-2")
+            cell_text = target_cell.text.strip()
+
+            if cell_text:
+                logger.info(f"Visa date extracted: {cell_text}")
+                return cell_text
+
+            logger.warning("Visa target cell is empty")
+    except (WebDriverException, TimeoutException) as e:
+        logger.error(f"Visa checker error: {e}")
     except Exception as e:
-        logging.error(f"Error loading last date: {e}")
+        logger.error(f"Unexpected visa checker error: {e}")
     return None
 
-def save_last_date(date_str):
+
+def run_visa_checker(config, data):
+    """Run the visa decisions checker. Returns True if data was updated."""
+    logger.info("--- Visa Decisions Checker: ENABLED ---")
+    current = get_visa_date()
+
+    if current is None:
+        print("❌ Visa checker: failed to retrieve date")
+        return False
+
+    previous = data.get("visa_last_date")
+    logger.info(f"Visa date — current: {current}, previous: {previous}")
+
+    if current == previous:
+        print(f"✅ Visa checker: no change. Date: {current}")
+        return False
+
+    print(f"🚨 VISA DATE CHANGE: {previous} -> {current}")
+
+    message = (
+        f"🚨 *Обновление даты ирландской иммиграционной визы*\n\n"
+        f"📅 *Категория:* Туризм или посещение семьи/друзей\n\n"
+        f"📊 *Детали изменения:*\n"
+        f"• Предыдущая дата: `{previous or 'Неизвестно'}`\n"
+        f"• Новая дата: `{current}`\n\n"
+        f"🔗 [Проверьте на сайте]({VISA_DECISIONS_URL})\n"
+        f"⏰ _{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+    )
+
+    if send_telegram(config, message):
+        print("📱 Visa notification sent!")
+    else:
+        print("❌ Failed to send visa notification")
+
+    data["visa_last_date"] = current
+    return True
+
+
+# =============================================================================
+# IRP RENEWAL CHECKER
+# =============================================================================
+
+
+def get_irp_renewal_date(stamp_category):
     """
-    Save the current date to the data file.
-    
-    Args:
-        date_str (str): The date string to save
+    Scrape IRP renewal page for the submission date currently being
+    processed for the given stamp category.
     """
     try:
-        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        data = {
-            'last_date': date_str,
-            'last_updated': datetime.now().isoformat()
-        }
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        logging.info(f"Saved date: {date_str}")
+        with chrome_driver() as driver:
+            logger.info(f"Loading: {IRP_RENEWAL_URL}")
+            driver.get(IRP_RENEWAL_URL)
+
+            wait = WebDriverWait(driver, 15)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+
+            # Wait for DataTable cells to populate
+            wait.until(
+                lambda d: any(
+                    cell.text.strip()
+                    for cell in d.find_elements(By.CSS_SELECTOR, "table td")
+                )
+            )
+
+            table = driver.find_element(By.CSS_SELECTOR, "table")
+            rows = table.find_elements(By.TAG_NAME, "tr")
+            logger.info(f"IRP table: {len(rows)} rows")
+
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 2:
+                    category = cells[0].text.strip()
+                    date_text = cells[1].text.strip()
+                    if category == stamp_category:
+                        logger.info(f"IRP Stamp {stamp_category}: {date_text}")
+                        return date_text
+
+            logger.warning(f"Stamp {stamp_category} not found in IRP table")
+    except (WebDriverException, TimeoutException) as e:
+        logger.error(f"IRP checker error: {e}")
     except Exception as e:
-        logging.error(f"Error saving date: {e}")
+        logger.error(f"Unexpected IRP checker error: {e}")
+    return None
 
-def send_telegram_notification(old_date, new_date):
-    """
-    Send a Telegram notification about the date change.
-    
-    Args:
-        old_date (str): The previous date
-        new_date (str): The new date
-    """
-    try:
-        # Telegram Bot API endpoint
-        url = f"https://api.telegram.org/bot{TELEGRAM_CONFIG['bot_token']}/sendMessage"
-        
-        # Format the message
-        message = f"""🚨 *Обновление даты ирландской иммиграционной визы*
 
-📅 *Категория:* Туризм или посещение семьи/друзей
+def run_irp_checker(config, data, stamp_category):
+    """Run the IRP renewal checker. Returns True if data was updated."""
+    logger.info(f"--- IRP Renewal Checker (Stamp {stamp_category}): ENABLED ---")
+    current = get_irp_renewal_date(stamp_category)
 
-📊 *Детали изменения:*
-• Предыдущая дата: `{old_date if old_date else 'Неизвестно'}`
-• Новая дата: `{new_date}`
-
-🔗 [Проверьте на сайте](https://www.irishimmigration.ie/visa-decisions/)
-⏰ _{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"""
-
-        # Prepare the payload
-        payload = {
-            'chat_id': TELEGRAM_CONFIG['chat_id'],
-            'text': message,
-            'parse_mode': 'Markdown',
-            'disable_web_page_preview': False
-        }
-        
-        # Send the message
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        
-        # Check if message was sent successfully
-        result = response.json()
-        if result.get('ok'):
-            logging.info("Telegram notification sent successfully")
-            return True
-        else:
-            logging.error(f"Telegram API error: {result.get('description', 'Unknown error')}")
-            return False
-            
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Telegram notification (network): {e}")
+    if current is None:
+        print("❌ IRP checker: failed to retrieve date")
         return False
-    except Exception as e:
-        logging.error(f"Error sending Telegram notification: {e}")
+
+    previous = data.get("irp_last_date")
+    logger.info(f"IRP date (Stamp {stamp_category}) — current: {current}, previous: {previous}")
+
+    if current == previous:
+        print(f"✅ IRP checker (Stamp {stamp_category}): no change. Date: {current}")
         return False
+
+    print(f"🚨 IRP DATE CHANGE (Stamp {stamp_category}): {previous} -> {current}")
+
+    message = (
+        f"🚨 *Обновление даты IRP Renewal (Stamp {stamp_category})*\n\n"
+        f"📅 *Категория:* Stamp {stamp_category}\n\n"
+        f"📊 *Детали изменения:*\n"
+        f"• Предыдущая дата рассмотрения: `{previous or 'Неизвестно'}`\n"
+        f"• Новая дата рассмотрения: `{current}`\n\n"
+        f"ℹ️ Это дата подачи заявлений, которые сейчас обрабатываются. "
+        f"Если ваша заявка подана до этой даты — она должна быть обработана.\n\n"
+        f"🔗 [Проверьте на сайте]({IRP_RENEWAL_URL})\n"
+        f"⏰ _{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+    )
+
+    if send_telegram(config, message):
+        print("📱 IRP notification sent!")
+    else:
+        print("❌ Failed to send IRP notification")
+
+    data["irp_last_date"] = current
+    data["irp_stamp_category"] = stamp_category
+    return True
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 
 def main():
-    """Main function to check for date changes and send notifications."""
-    logging.info("Starting visa date checker")
-    
-    # Check if Telegram configuration is properly set
-    if not TELEGRAM_CONFIG:
-        logging.error("Telegram configuration not loaded. Exiting.")
+    """Entry point — runs enabled checkers and persists state on changes."""
+    logger.info("=" * 60)
+    logger.info("Starting Irish Immigration Checker")
+    logger.info("=" * 60)
+
+    config = load_config()
+    if not config:
         return
-    
-    # Get current date from website
-    current_date = get_visa_date()
 
-    # Load last known date
-    last_date = load_last_date()
-    
-    logging.info(f"Current date: {current_date}")
-    logging.info(f"Last known date: {last_date}")
+    visa_enabled = config.get("visa_checker_enabled", False)
+    irp_enabled = config.get("irp_checker_enabled", True)
+    irp_stamp = config.get("irp_stamp_category", "4")
 
-    if current_date != last_date:
-        # Date has changed - send notification and update saved date
-        logging.info(f"Date change detected: {last_date} -> {current_date}")
-        print(f"🚨 DATE CHANGE DETECTED: {last_date} -> {current_date}")
-        
-        # Send Telegram notification
-        success = send_telegram_notification(last_date, current_date)
-        if success:
-            print("📱 Telegram notification sent!")
-        else:
-            print("❌ Failed to send Telegram notification - check logs")
-            
-        save_last_date(current_date)
+    data = load_data()
+    changed = False
+
+    # Visa decisions
+    if visa_enabled:
+        changed |= run_visa_checker(config, data)
     else:
-        # No change
-        logging.info("No date change detected")
-        print(f"✅ No change detected. Current date: {current_date}")
+        logger.info("--- Visa Decisions Checker: DISABLED ---")
+        print("⏸️  Visa checker: disabled")
+
+    # IRP renewal
+    if irp_enabled:
+        changed |= run_irp_checker(config, data, irp_stamp)
+    else:
+        logger.info("--- IRP Renewal Checker: DISABLED ---")
+        print("⏸️  IRP checker: disabled")
+
+    if changed:
+        save_data(data)
+
+    logger.info("Run complete")
+
 
 if __name__ == "__main__":
     main()
