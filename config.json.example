@@ -1,4 +1,7 @@
 {
     "bot_token": "YOUR_BOT_TOKEN",
-    "chat_id": "YOUR_CHAT_ID"
+    "chat_id": "YOUR_CHAT_ID",
+    "visa_checker_enabled": false,
+    "irp_checker_enabled": true,
+    "irp_stamp_category": "4"
 }
